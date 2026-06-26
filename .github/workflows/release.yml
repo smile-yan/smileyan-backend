@@ -5,6 +5,8 @@ name: Release
 # - Publishes a GitHub Release containing source code + a prod config.yaml
 #   (no binary, no .env, no secrets).
 # - Auto-generates a changelog from grouped PRs / commits since the previous tag.
+# - For stable (non-prerelease) tags, additionally deploys the new release
+#   to the production CentOS server over SSH.
 
 on:
   push:
@@ -144,7 +146,17 @@ jobs:
           ssh-keyscan -p "${{ secrets.SSH_INSTANCE_PORT }}" \
             -H "${{ secrets.SSH_INSTANCE_ADDR }}" >> ~/.ssh/known_hosts
 
-      - name: Upload and restart on server
+      - name: Upload tarball to server
+        env:
+          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
+          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
+          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
+        run: |
+          set -e
+          scp -P "$SSH_INSTANCE_PORT" dist/smileyan-backend-prod.tar.gz \
+            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/smileyan-backend-prod.tar.gz"
+
+      - name: Run remote deploy script
         env:
           SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
           SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
@@ -152,80 +164,18 @@ jobs:
           SERVER_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
         run: |
           set -e
-          # Stage the tarball on the server.
-          scp -P "$SSH_INSTANCE_PORT" dist/smileyan-backend-prod.tar.gz \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/smileyan-backend-prod.tar.gz"
-
-          # Push the deploy script over stdin. The four values are exported
-          # into the remote shell explicitly, so the heredoc does not need
-          # any GitHub Actions expression interpolation.
+          # Pass the three required values into the remote script via env vars.
+          # The heredoc here is a single-line, fully quoted shell command that
+          # the local shell evaluates; the remote script itself is the
+          # well-formed `scripts/deploy-remote.sh` file in the repo.
           DEPLOY_PATH="$SERVER_DEPLOY_PATH" \
           RELEASE_TAG="${{ github.ref_name }}" \
           TARBALL_PATH="/tmp/smileyan-backend-prod.tar.gz" \
-          ssh -p "$SSH_INSTANCE_PORT" "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" bash -s <<'REMOTE'
-            set -e
-            : "${DEPLOY_PATH:?DEPLOY_PATH must be set}"
-            : "${RELEASE_TAG:?RELEASE_TAG must be set}"
-            : "${TARBALL_PATH:?TARBALL_PATH must be set}"
-
-            RELEASE_PATH="$DEPLOY_PATH/releases/$RELEASE_TAG"
-            CURRENT_LINK="$DEPLOY_PATH/current"
-
-            mkdir -p "$DEPLOY_PATH/releases" "$DEPLOY_PATH/shared"
-
-            # Stop the currently running instance (if any).
-            if [ -x "$CURRENT_LINK/stop.sh" ]; then
-              "$CURRENT_LINK/stop.sh" || true
-            fi
-
-            # Extract the new release to its own folder.
-            rm -rf "$RELEASE_PATH"
-            mkdir -p "$RELEASE_PATH"
-            tar -xzf "$TARBALL_PATH" -C "$RELEASE_PATH"
-
-            # Generate run scripts (the tarball does not include them).
-            cat > "$RELEASE_PATH/start.sh" <<'START'
-            #!/bin/bash
-            cd "$(dirname "$0")"
-            if [ -f ../shared/.env ]; then
-              set -a
-              . ../shared/.env
-              set +a
-            fi
-            # Build the binary on first run; the host has Go installed.
-            if [ ! -x ./smileyan-backend ]; then
-              go build -ldflags="-s -w" -o smileyan-backend .
-            fi
-            mkdir -p logs
-            nohup ./smileyan-backend > logs/app.log 2>&1 &
-            echo $! > logs/app.pid
-START
-            cat > "$RELEASE_PATH/stop.sh" <<'STOP'
-            #!/bin/bash
-            cd "$(dirname "$0")"
-            if [ -f logs/app.pid ]; then
-              kill "$(cat logs/app.pid)" 2>/dev/null || true
-              rm -f logs/app.pid
-            fi
-            pkill -f smileyan-backend || true
-STOP
-            cat > "$RELEASE_PATH/restart.sh" <<'RESTART'
-            #!/bin/bash
-            cd "$(dirname "$0")"
-            ./stop.sh
-            sleep 1
-            ./start.sh
-RESTART
-            chmod +x "$RELEASE_PATH/start.sh" "$RELEASE_PATH/stop.sh" "$RELEASE_PATH/restart.sh"
-
-            # Atomically repoint the live symlink.
-            ln -sfn "$RELEASE_PATH" "$CURRENT_LINK.tmp"
-            mv -T "$CURRENT_LINK.tmp" "$CURRENT_LINK"
-
-            # Start the new release.
-            "$CURRENT_LINK/start.sh"
-          REMOTE
-        shell: bash
+          scp -P "$SSH_INSTANCE_PORT" \
+            scripts/deploy-remote.sh \
+            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/deploy-remote.sh"
+          ssh -p "$SSH_INSTANCE_PORT" "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
+            "DEPLOY_PATH='$SERVER_DEPLOY_PATH' RELEASE_TAG='${{ github.ref_name }}' TARBALL_PATH='/tmp/smileyan-backend-prod.tar.gz' bash /tmp/deploy-remote.sh"
 
       - name: Verify deployment
         env:
