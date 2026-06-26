@@ -1,0 +1,34 @@
+#!/bin/bash
+
+# Smileyan Backend 停止脚本
+
+# 获取脚本所在目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+
+# 方法1: 从 pid 文件获取进程 ID
+if [ -f "$PROJECT_DIR/logs/app.pid" ]; then
+    PID=$(cat "$PROJECT_DIR/logs/app.pid")
+    if kill -0 $PID 2>/dev/null; then
+        echo "正在停止服务 (PID: $PID)..."
+        kill $PID
+        rm -f "$PROJECT_DIR/logs/app.pid"
+        echo "服务已停止"
+        exit 0
+    fi
+fi
+
+# 方法2: 通过端口查找进程
+if lsof -i :8080 > /dev/null 2>&1; then
+    PID=$(lsof -i :8080 | grep LISTEN | awk '{print $2}' | head -1)
+    if [ -n "$PID" ]; then
+        echo "正在停止服务 (PID: $PID)..."
+        kill $PID 2>/dev/null
+        rm -f "$PROJECT_DIR/logs/app.pid"
+        echo "服务已停止"
+        exit 0
+    fi
+fi
+
+echo "服务未运行"
+exit 0

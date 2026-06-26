@@ -1,0 +1,50 @@
+server:
+  port: 8080
+  mode: debug
+
+database:
+  # 数据库地址
+  host: localhost
+  port: 3306
+  # 数据库用户名
+  user: root
+  # 数据库密码，请通过环境变量 SMILEYAN_BACKEND_DB_PASSWORD 设置
+  password: ""
+  # 数据库名称
+  dbname: smileyan
+  charset: utf8mb4
+  max_idle_conns: 10
+  max_open_conns: 100
+
+redis:
+  # Redis 地址
+  host: localhost
+  port: 6379
+  # Redis 用户名
+  username: ""
+  # Redis 密码，请通过环境变量 SMILEYAN_BACKEND_REDIS_PASSWORD 设置
+  password: ""
+  db: 0
+
+
+email:
+  host: smtp.exmail.qq.com
+  port: 465
+  username: root@smileyan.cn
+  # 邮箱密码，请通过环境变量 SMILEYAN_BACKEND_EMAIL_PASSWORD 设置
+  password: ""
+  use_ssl: true
+
+jwt:
+  # JWT 密钥，请通过环境变量 SMILEYAN_BACKEND_JWT_SECRET 设置
+  secret: ""
+  expire_hours: 168  # 7 days
+
+# 管理员邮箱列表
+admin_emails:
+  - i@ccyan.cn
+
+upload:
+  path: ./uploads
+  avatar_path: ./uploads/avatars
+  max_size: 5  # MB

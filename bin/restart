@@ -1,0 +1,19 @@
+#!/bin/bash
+
+# Smileyan Backend 重启脚本
+
+# 获取脚本所在目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "正在重启 Smileyan Backend..."
+
+# 停止服务
+"$SCRIPT_DIR/stop"
+
+# 等待一下
+sleep 1
+
+# 启动服务
+"$SCRIPT_DIR/start"
+
+echo "重启完成"
