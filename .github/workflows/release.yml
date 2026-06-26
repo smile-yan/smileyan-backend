@@ -118,6 +118,14 @@ jobs:
     continue-on-error: false
 
     steps:
+      - name: Checkout
+        # Required so `gh release download` can locate the repo via .git
+        # (it reads `git config --get remote.origin.url` to know which
+        # release to fetch). No source code from this checkout is used.
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Download release tarball
         # Pull the tarball that the release job just published. Using
         # `gh release download` (not actions/download-artifact) because
