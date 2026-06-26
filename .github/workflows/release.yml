@@ -1,0 +1,239 @@
+name: Release
+
+# Triggers on pushes of tags matching vX.Y.Z (e.g. v1.0.0, v2.3.1-rc1).
+# - Performs a build-only sanity check for linux/amd64 against Go 1.25.
+# - Publishes a GitHub Release containing source code + a prod config.yaml
+#   (no binary, no .env, no secrets).
+# - Auto-generates a changelog from grouped PRs / commits since the previous tag.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write   # required to create the GitHub Release and upload assets
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    env:
+      # ---- Secrets are loaded into the runner environment one by one.
+      #      None of these values are written into the release assets;
+      #      they are only used to satisfy `go build` / config validation
+      #      during the build step.
+      SMILEYAN_BACKEND_DB_HOST: ${{ secrets.SMILEYAN_BACKEND_DB_HOST }}
+      SMILEYAN_BACKEND_DB_USER: ${{ secrets.SMILEYAN_BACKEND_DB_USER }}
+      SMILEYAN_BACKEND_DB_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_DB_PASSWORD }}
+      SMILEYAN_BACKEND_DB_NAME: ${{ secrets.SMILEYAN_BACKEND_DB_NAME }}
+      SMILEYAN_BACKEND_REDIS_HOST: ${{ secrets.SMILEYAN_BACKEND_REDIS_HOST }}
+      SMILEYAN_BACKEND_REDIS_USERNAME: ${{ secrets.SMILEYAN_BACKEND_REDIS_USERNAME }}
+      SMILEYAN_BACKEND_REDIS_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_REDIS_PASSWORD }}
+      SMILEYAN_BACKEND_EMAIL_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_EMAIL_PASSWORD }}
+      SMILEYAN_BACKEND_JWT_SECRET: ${{ secrets.SMILEYAN_BACKEND_JWT_SECRET }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history needed for changelog generation
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Verify dependencies
+        run: go mod download
+
+      - name: Sanity build (linux/amd64)
+        # The release does not ship a binary, but we still want CI to fail
+        # early if the code does not compile for the target platform.
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -ldflags="-s -w" -o /tmp/smileyan-backend ./main.go
+          ls -la /tmp/smileyan-backend
+
+      - name: Prepare release assets
+        # Build a clean prod/ folder with the source tree + a prod config.yaml.
+        # Secrets are intentionally NOT included.
+        run: |
+          set -e
+          rm -rf release
+          mkdir -p release
+
+          # 1. Copy the full source tree (excluding build output / .git).
+          tar --exclude='./release' --exclude='./output' \
+              --exclude='./.git' --exclude='./logs' \
+              --exclude='./uploads' \
+              -czf /tmp/source.tar.gz .
+          tar -xzf /tmp/source.tar.gz -C release
+
+          # 2. Generate a prod config.yaml from the committed template.
+          #    The `mode: debug` line in config.yaml is replaced with `mode: prod`.
+          sed 's/mode: debug/mode: prod/' config.yaml > release/config.yaml
+
+          # 3. Drop the dev-only packaging script from the release.
+          rm -f release/bin/build-and-package.sh
+
+          # 4. Sanity check: make sure no .env is in the bundle.
+          if find release -name '.env' -print -quit | grep -q .; then
+            echo "ERROR: .env file leaked into the release bundle" >&2
+            exit 1
+          fi
+
+          # 5. Repack as a tarball for upload.
+          tar --no-xattr -czf smileyan-backend-prod.tar.gz -C release .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          # Auto-generate the release notes (grouped by PR label / commit type)
+          # from the commits and PRs since the previous tag.
+          generate_release_notes: true
+          # Upload only the source+prod tarball and the rendered config.yaml.
+          # No binary, no .env, no secrets.
+          files: |
+            smileyan-backend-prod.tar.gz
+            config.yaml
+          draft: false
+          # Tags like v1.2.0-rc1 or v1.2.0-beta3 are flagged as pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
+          fail_on_unmatched_files: true
+
+  deploy:
+    name: Deploy to production server
+    # Only deploy on real release tags, never on rc/alpha/beta.
+    # Mirrors the prerelease check in the release job above.
+    needs: release
+    if: github.event_name == 'push' && !contains(github.ref_name, '-rc') && !contains(github.ref_name, '-alpha') && !contains(github.ref_name, '-beta')
+    runs-on: ubuntu-latest
+    # Don't let a failed deploy silently fall through; surface it.
+    continue-on-error: false
+
+    steps:
+      - name: Download release tarball
+        # Pull the tarball that the release job just published. Using
+        # `gh release download` (not actions/download-artifact) because
+        # the asset lives on the GitHub Release, not in the workflow's
+        # artifact store.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ github.ref_name }}" \
+            --pattern "smileyan-backend-prod.tar.gz" \
+            --dir dist
+          ls -la dist
+
+      - name: Set up SSH key
+        # Writes the private key to a file with 0600 perms and registers it
+        # with ssh-agent so subsequent steps can use it transparently.
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Add server to known_hosts
+        # Avoid the "host key verification failed" interactive prompt.
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.SSH_INSTANCE_PORT }}" \
+            -H "${{ secrets.SSH_INSTANCE_ADDR }}" >> ~/.ssh/known_hosts
+
+      - name: Upload and restart on server
+        env:
+          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
+          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
+          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
+          SERVER_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
+        run: |
+          set -e
+          # Stage the tarball on the server.
+          scp -P "$SSH_INSTANCE_PORT" dist/smileyan-backend-prod.tar.gz \
+            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/smileyan-backend-prod.tar.gz"
+
+          # Push the deploy script over stdin. The four values are exported
+          # into the remote shell explicitly, so the heredoc does not need
+          # any GitHub Actions expression interpolation.
+          DEPLOY_PATH="$SERVER_DEPLOY_PATH" \
+          RELEASE_TAG="${{ github.ref_name }}" \
+          TARBALL_PATH="/tmp/smileyan-backend-prod.tar.gz" \
+          ssh -p "$SSH_INSTANCE_PORT" "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" bash -s <<'REMOTE'
+            set -e
+            : "${DEPLOY_PATH:?DEPLOY_PATH must be set}"
+            : "${RELEASE_TAG:?RELEASE_TAG must be set}"
+            : "${TARBALL_PATH:?TARBALL_PATH must be set}"
+
+            RELEASE_PATH="$DEPLOY_PATH/releases/$RELEASE_TAG"
+            CURRENT_LINK="$DEPLOY_PATH/current"
+
+            mkdir -p "$DEPLOY_PATH/releases" "$DEPLOY_PATH/shared"
+
+            # Stop the currently running instance (if any).
+            if [ -x "$CURRENT_LINK/stop.sh" ]; then
+              "$CURRENT_LINK/stop.sh" || true
+            fi
+
+            # Extract the new release to its own folder.
+            rm -rf "$RELEASE_PATH"
+            mkdir -p "$RELEASE_PATH"
+            tar -xzf "$TARBALL_PATH" -C "$RELEASE_PATH"
+
+            # Generate run scripts (the tarball does not include them).
+            cat > "$RELEASE_PATH/start.sh" <<'START'
+            #!/bin/bash
+            cd "$(dirname "$0")"
+            if [ -f ../shared/.env ]; then
+              set -a
+              . ../shared/.env
+              set +a
+            fi
+            # Build the binary on first run; the host has Go installed.
+            if [ ! -x ./smileyan-backend ]; then
+              go build -ldflags="-s -w" -o smileyan-backend .
+            fi
+            mkdir -p logs
+            nohup ./smileyan-backend > logs/app.log 2>&1 &
+            echo $! > logs/app.pid
+START
+            cat > "$RELEASE_PATH/stop.sh" <<'STOP'
+            #!/bin/bash
+            cd "$(dirname "$0")"
+            if [ -f logs/app.pid ]; then
+              kill "$(cat logs/app.pid)" 2>/dev/null || true
+              rm -f logs/app.pid
+            fi
+            pkill -f smileyan-backend || true
+STOP
+            cat > "$RELEASE_PATH/restart.sh" <<'RESTART'
+            #!/bin/bash
+            cd "$(dirname "$0")"
+            ./stop.sh
+            sleep 1
+            ./start.sh
+RESTART
+            chmod +x "$RELEASE_PATH/start.sh" "$RELEASE_PATH/stop.sh" "$RELEASE_PATH/restart.sh"
+
+            # Atomically repoint the live symlink.
+            ln -sfn "$RELEASE_PATH" "$CURRENT_LINK.tmp"
+            mv -T "$CURRENT_LINK.tmp" "$CURRENT_LINK"
+
+            # Start the new release.
+            "$CURRENT_LINK/start.sh"
+          REMOTE
+        shell: bash
+
+      - name: Verify deployment
+        env:
+          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
+          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
+          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
+        run: |
+          # Give the process a moment to bind the port.
+          sleep 3
+          ssh -p "$SSH_INSTANCE_PORT" "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
+            "curl -fsS http://127.0.0.1:8080/api/categories >/dev/null && echo 'Health check OK'"
