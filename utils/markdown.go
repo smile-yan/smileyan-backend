@@ -7,7 +7,6 @@ import (
 
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/extension"
-	"github.com/yuin/goldmark/parser"
 	"github.com/yuin/goldmark/renderer/html"
 )
 
@@ -15,17 +14,20 @@ import (
 func MarkdownToHTML(markdown []byte) []byte {
 	// 创建 goldmark 实例，配置与前端 markdown-it 一致
 	// 启用 Raw HTML 以支持内嵌 SVG 等 HTML 元素
+	//
+	// 注：goldmark v1.7.0 的 API：
+	//   - parser 端默认就允许 raw HTML 解析，无需 option
+	//   - renderer 端使用 html.WithUnsafe() 来原样输出 raw HTML
+	//     （"unsafe" 是 goldmark 的命名，指允许 raw HTML/JS 直通；前端 Vue
+	//      在显示前会做 XSS 防护，所以这里直通是想要的行为）
 	md := goldmark.New(
 		goldmark.WithExtensions(
 			extension.GFM,
 			extension.Linkify,
 			extension.Typographer,
 		),
-		goldmark.WithParserOptions(
-			parser.WithRawHtml(),
-		),
 		goldmark.WithRendererOptions(
-			html.WithRawHtml(),
+			html.WithUnsafe(),
 		),
 	)
 
