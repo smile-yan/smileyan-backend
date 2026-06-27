@@ -127,67 +127,81 @@ jobs:
           fetch-depth: 1
 
       - name: Diagnose secret availability
-        # List which secrets used by this workflow are actually configured
-        # in Settings -> Secrets and variables -> Actions. The API exposes
-        # secret *names* (never values) for repos whose token has the
-        # `secrets: read` scope. This surfaces typos and missing secrets
-        # before the SSH step fails with a vague "argument is empty".
+        # Test each secret by reading its value into a bash variable. An
+        # unconfigured secret expands to the empty string, so an empty
+        # value is the "missing" signal.
+        #
+        # We previously tried the GitHub Secrets API to list configured
+        # names, but the default GITHUB_TOKEN returns 403 on that endpoint
+        # (it requires a PAT or a token with `secrets: read` scope). The
+        # value-test approach below is more reliable and doesn't need any
+        # extra scopes.
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
+          S_DB_HOST: ${{ secrets.SMILEYAN_BACKEND_DB_HOST }}
+          S_DB_USER: ${{ secrets.SMILEYAN_BACKEND_DB_USER }}
+          S_DB_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_DB_PASSWORD }}
+          S_DB_NAME: ${{ secrets.SMILEYAN_BACKEND_DB_NAME }}
+          S_REDIS_HOST: ${{ secrets.SMILEYAN_BACKEND_REDIS_HOST }}
+          S_REDIS_USERNAME: ${{ secrets.SMILEYAN_BACKEND_REDIS_USERNAME }}
+          S_REDIS_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_REDIS_PASSWORD }}
+          S_EMAIL_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_EMAIL_PASSWORD }}
+          S_JWT_SECRET: ${{ secrets.SMILEYAN_BACKEND_JWT_SECRET }}
+          S_SSH_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
+          S_SSH_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
+          S_SSH_USER: ${{ secrets.SSH_INSTANCE_USER }}
+          S_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          S_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
         run: |
           set -u
-          # Secrets this workflow actually references.
-          EXPECTED=(
-            SMILEYAN_BACKEND_DB_HOST
-            SMILEYAN_BACKEND_DB_USER
-            SMILEYAN_BACKEND_DB_PASSWORD
-            SMILEYAN_BACKEND_DB_NAME
-            SMILEYAN_BACKEND_REDIS_HOST
-            SMILEYAN_BACKEND_REDIS_USERNAME
-            SMILEYAN_BACKEND_REDIS_PASSWORD
-            SMILEYAN_BACKEND_EMAIL_PASSWORD
-            SMILEYAN_BACKEND_JWT_SECRET
-            SSH_INSTANCE_ADDR
-            SSH_INSTANCE_PORT
-            SSH_INSTANCE_USER
-            DEPLOY_SSH_KEY
-            SERVER_DEPLOY_PATH
+          # Format: "NAME|VALUE". VALUE is "set" if non-empty, otherwise "empty".
+          PAIRS=(
+            "SMILEYAN_BACKEND_DB_HOST|${S_DB_HOST}"
+            "SMILEYAN_BACKEND_DB_USER|${S_DB_USER}"
+            "SMILEYAN_BACKEND_DB_PASSWORD|${S_DB_PASSWORD}"
+            "SMILEYAN_BACKEND_DB_NAME|${S_DB_NAME}"
+            "SMILEYAN_BACKEND_REDIS_HOST|${S_REDIS_HOST}"
+            "SMILEYAN_BACKEND_REDIS_USERNAME|${S_REDIS_USERNAME}"
+            "SMILEYAN_BACKEND_REDIS_PASSWORD|${S_REDIS_PASSWORD}"
+            "SMILEYAN_BACKEND_EMAIL_PASSWORD|${S_EMAIL_PASSWORD}"
+            "SMILEYAN_BACKEND_JWT_SECRET|${S_JWT_SECRET}"
+            "SSH_INSTANCE_ADDR|${S_SSH_ADDR}"
+            "SSH_INSTANCE_PORT|${S_SSH_PORT}"
+            "SSH_INSTANCE_USER|${S_SSH_USER}"
+            "DEPLOY_SSH_KEY|${S_SSH_KEY}"
+            "SERVER_DEPLOY_PATH|${S_DEPLOY_PATH}"
           )
 
-          # Ask GitHub which secret names exist. The API returns names only,
-          # never values. --paginate handles pages of 100 automatically.
-          CONFIGURED_NAMES=$(gh api \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            --paginate \
-            "/repos/${REPO}/actions/secrets?per_page=100" \
-            | jq -r '.secrets[].name' \
-            | sort -u)
-
           echo "=== Secret availability report ==="
-          echo "Repository: ${REPO}"
+          echo "A secret counts as 'OK' if its value is non-empty."
+          echo "An empty value means either the secret is not configured, or"
+          echo "it is configured as a Deploy Key (Settings/Keys) instead of"
+          echo "an Actions secret (Settings -> Secrets and variables -> Actions)."
           echo
           printf '%-40s %s\n' 'SECRET' 'STATUS'
           printf '%-40s %s\n' '------' '------'
           MISSING=()
-          for s in "${EXPECTED[@]}"; do
-            if printf '%s\n' "$CONFIGURED_NAMES" | grep -Fxq "$s"; then
-              printf '%-40s %s\n' "$s" 'OK (configured)'
+          for pair in "${PAIRS[@]}"; do
+            name="${pair%%|*}"
+            val="${pair#*|}"
+            if [ -n "$val" ]; then
+              printf '%-40s %s\n' "$name" 'OK (non-empty)'
             else
-              printf '%-40s %s\n' "$s" 'MISSING (not configured)'
-              MISSING+=("$s")
+              printf '%-40s %s\n' "$name" 'EMPTY (not accessible to this workflow)'
+              MISSING+=("$name")
             fi
           done
 
           echo
           if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "FAIL: ${#MISSING[@]} required secret(s) are missing:"
+            echo "FAIL: ${#MISSING[@]} required secret(s) are not accessible:"
             printf '  - %s\n' "${MISSING[@]}"
             echo
-            echo "Fix: Settings -> Secrets and variables -> Actions -> New repository secret"
-            echo "Note: a value listed under Settings/Keys (Deploy keys) is NOT accessible to workflows."
-            echo "      Workflows read from Settings -> Secrets and variables -> Actions only."
+            echo "Most likely causes:"
+            echo "  1. The secret is not configured in"
+            echo "     Settings -> Secrets and variables -> Actions."
+            echo "  2. The secret is configured under Settings/Keys (Deploy keys)"
+            echo "     which workflows cannot read. Copy the same value into a"
+            echo "     repository secret with the exact name shown above."
             exit 1
           fi
           echo "All required secrets are present."
