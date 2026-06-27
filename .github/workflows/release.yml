@@ -126,6 +126,72 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Diagnose secret availability
+        # List which secrets used by this workflow are actually configured
+        # in Settings -> Secrets and variables -> Actions. The API exposes
+        # secret *names* (never values) for repos whose token has the
+        # `secrets: read` scope. This surfaces typos and missing secrets
+        # before the SSH step fails with a vague "argument is empty".
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -u
+          # Secrets this workflow actually references.
+          EXPECTED=(
+            SMILEYAN_BACKEND_DB_HOST
+            SMILEYAN_BACKEND_DB_USER
+            SMILEYAN_BACKEND_DB_PASSWORD
+            SMILEYAN_BACKEND_DB_NAME
+            SMILEYAN_BACKEND_REDIS_HOST
+            SMILEYAN_BACKEND_REDIS_USERNAME
+            SMILEYAN_BACKEND_REDIS_PASSWORD
+            SMILEYAN_BACKEND_EMAIL_PASSWORD
+            SMILEYAN_BACKEND_JWT_SECRET
+            SSH_INSTANCE_ADDR
+            SSH_INSTANCE_PORT
+            SSH_INSTANCE_USER
+            DEPLOY_SSH_KEY
+            SERVER_DEPLOY_PATH
+          )
+
+          # Ask GitHub which secret names exist. The API returns names only,
+          # never values. --paginate handles pages of 100 automatically.
+          CONFIGURED_NAMES=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --paginate \
+            "/repos/${REPO}/actions/secrets?per_page=100" \
+            | jq -r '.secrets[].name' \
+            | sort -u)
+
+          echo "=== Secret availability report ==="
+          echo "Repository: ${REPO}"
+          echo
+          printf '%-40s %s\n' 'SECRET' 'STATUS'
+          printf '%-40s %s\n' '------' '------'
+          MISSING=()
+          for s in "${EXPECTED[@]}"; do
+            if printf '%s\n' "$CONFIGURED_NAMES" | grep -Fxq "$s"; then
+              printf '%-40s %s\n' "$s" 'OK (configured)'
+            else
+              printf '%-40s %s\n' "$s" 'MISSING (not configured)'
+              MISSING+=("$s")
+            fi
+          done
+
+          echo
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "FAIL: ${#MISSING[@]} required secret(s) are missing:"
+            printf '  - %s\n' "${MISSING[@]}"
+            echo
+            echo "Fix: Settings -> Secrets and variables -> Actions -> New repository secret"
+            echo "Note: a value listed under Settings/Keys (Deploy keys) is NOT accessible to workflows."
+            echo "      Workflows read from Settings -> Secrets and variables -> Actions only."
+            exit 1
+          fi
+          echo "All required secrets are present."
+
       - name: Download release tarball
         # Pull the tarball that the release job just published. Using
         # `gh release download` (not actions/download-artifact) because
