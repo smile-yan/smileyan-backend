@@ -283,11 +283,15 @@ jobs:
           SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
           SERVER_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
         run: |
+          # Pass DEPLOY_PATH as an env var to the remote shell so the
+          # single-quoted heredoc body (no $ expansion) can still use it.
           ssh -p "$SSH_INSTANCE_PORT" \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" bash -s <<'REMOTE'
+            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
+            env DEPLOY_PATH="$SERVER_DEPLOY_PATH" bash -s <<'REMOTE'
             set +e
-            DEPLOY_PATH="$SERVER_DEPLOY_PATH"
+            echo "=== DEPLOY_PATH is: [$DEPLOY_PATH] ==="
+            echo
             echo "=== current symlink ==="
             ls -la "$DEPLOY_PATH/current" 2>&1 || true
             echo
