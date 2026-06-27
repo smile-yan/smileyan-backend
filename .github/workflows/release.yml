@@ -51,16 +51,17 @@ jobs:
         run: go mod download
 
       - name: Sanity build (linux/amd64)
-        # The release does not ship a binary, but we still want CI to fail
-        # early if the code does not compile for the target platform.
+        # The release ships a prebuilt binary; the host does not need Go
+        # installed. This step also serves as a compile-time check.
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
             go build -ldflags="-s -w" -o /tmp/smileyan-backend ./main.go
           ls -la /tmp/smileyan-backend
 
       - name: Prepare release assets
-        # Build a clean prod/ folder with the source tree + a prod config.yaml.
-        # Secrets are intentionally NOT included.
+        # Build a clean prod/ folder with the source tree + a prod config.yaml
+        # + the prebuilt linux/amd64 binary. Secrets are intentionally NOT
+        # included.
         run: |
           set -e
           rm -rf release
@@ -73,20 +74,25 @@ jobs:
               -czf /tmp/source.tar.gz .
           tar -xzf /tmp/source.tar.gz -C release
 
-          # 2. Generate a prod config.yaml from the committed template.
+          # 2. Drop the dev-only packaging script from the release.
+          rm -f release/bin/build-and-package.sh
+
+          # 3. Generate a prod config.yaml from the committed template.
           #    The `mode: debug` line in config.yaml is replaced with `mode: prod`.
           sed 's/mode: debug/mode: prod/' config.yaml > release/config.yaml
 
-          # 3. Drop the dev-only packaging script from the release.
-          rm -f release/bin/build-and-package.sh
+          # 4. Place the prebuilt binary at the root of the release dir so
+          #    deploy-remote.sh can find it as ./smileyan-backend.
+          mv /tmp/smileyan-backend release/smileyan-backend
+          chmod +x release/smileyan-backend
 
-          # 4. Sanity check: make sure no .env is in the bundle.
+          # 5. Sanity check: make sure no .env is in the bundle.
           if find release -name '.env' -print -quit | grep -q .; then
             echo "ERROR: .env file leaked into the release bundle" >&2
             exit 1
           fi
 
-          # 5. Repack as a tarball for upload.
+          # 6. Repack as a tarball for upload.
           tar --no-xattr -czf smileyan-backend-prod.tar.gz -C release .
 
       - name: Create GitHub Release

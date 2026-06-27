@@ -34,10 +34,13 @@ if [ -f ../shared/.env ]; then
   . ../shared/.env
   set +a
 fi
-# Build the binary on first run; the host has Go installed.
+# The release ships a prebuilt binary built by the CI runner; the host
+# does not need Go installed.
 if [ ! -x ./smileyan-backend ]; then
-  go build -ldflags="-s -w" -o smileyan-backend .
+  echo "FATAL: smileyan-backend binary not found in $(pwd)" >&2
+  exit 1
 fi
+chmod +x ./smileyan-backend
 mkdir -p logs
 nohup ./smileyan-backend > logs/app.log 2>&1 &
 echo $! > logs/app.pid
