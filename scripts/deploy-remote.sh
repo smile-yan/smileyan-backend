@@ -1,19 +1,57 @@
 #!/bin/bash
 # Server-side deploy script. Invoked over SSH from the GitHub Actions
-# deploy job. Expects three environment variables to be set:
-#   DEPLOY_PATH  - base directory on the server (e.g. /opt/smileyan-backend)
-#   RELEASE_TAG  - the tag being deployed (e.g. v1.0.0)
-#   TARBALL_PATH - absolute path of the uploaded tarball
+# deploy job. Expects these environment variables to be set:
+#   DEPLOY_PATH   - base directory on the server (e.g. /opt/smileyan-backend)
+#   RELEASE_TAG   - the tag being deployed (e.g. v1.0.0)
+#   TARBALL_PATH  - absolute path of the uploaded tarball
+#   S_DB_HOST     - SMILEYAN_BACKEND_DB_HOST value
+#   S_DB_USER     - SMILEYAN_BACKEND_DB_USER value
+#   S_DB_PASSWORD - SMILEYAN_BACKEND_DB_PASSWORD value
+#   S_DB_NAME     - SMILEYAN_BACKEND_DB_NAME value
+#   S_REDIS_HOST  - SMILEYAN_BACKEND_REDIS_HOST value
+#   S_REDIS_USER  - SMILEYAN_BACKEND_REDIS_USERNAME value
+#   S_REDIS_PASS  - SMILEYAN_BACKEND_REDIS_PASSWORD value
+#   S_EMAIL_PASS  - SMILEYAN_BACKEND_EMAIL_PASSWORD value
+#   S_JWT_SECRET  - SMILEYAN_BACKEND_JWT_SECRET value
 
 set -e
 : "${DEPLOY_PATH:?DEPLOY_PATH must be set}"
 : "${RELEASE_TAG:?RELEASE_TAG must be set}"
 : "${TARBALL_PATH:?TARBALL_PATH must be set}"
+: "${S_DB_HOST:?S_DB_HOST must be set}"
+: "${S_DB_USER:?S_DB_USER must be set}"
+: "${S_DB_PASSWORD:?S_DB_PASSWORD must be set}"
+: "${S_DB_NAME:?S_DB_NAME must be set}"
+: "${S_REDIS_HOST:?S_REDIS_HOST must be set}"
+: "${S_REDIS_USER:?S_REDIS_USER must be set}"
+: "${S_REDIS_PASS:?S_REDIS_PASS must be set}"
+: "${S_EMAIL_PASS:?S_EMAIL_PASS must be set}"
+: "${S_JWT_SECRET:?S_JWT_SECRET must be set}"
 
 RELEASE_PATH="$DEPLOY_PATH/releases/$RELEASE_TAG"
 CURRENT_LINK="$DEPLOY_PATH/current"
 
 mkdir -p "$DEPLOY_PATH/releases" "$DEPLOY_PATH/shared"
+
+# Write the shared env file that start.sh sources. The file is owned by
+# the deploy user and mode 0600. We use an atomic move so a crashed
+# half-written file is never picked up.
+SHARED_ENV="$DEPLOY_PATH/shared/.env"
+SHARED_ENV_TMP="$SHARED_ENV.tmp.$$"
+cat > "$SHARED_ENV_TMP" <<EOF
+SMILEYAN_BACKEND_DB_HOST=$S_DB_HOST
+SMILEYAN_BACKEND_DB_USER=$S_DB_USER
+SMILEYAN_BACKEND_DB_PASSWORD=$S_DB_PASSWORD
+SMILEYAN_BACKEND_DB_NAME=$S_DB_NAME
+SMILEYAN_BACKEND_REDIS_HOST=$S_REDIS_HOST
+SMILEYAN_BACKEND_REDIS_USERNAME=$S_REDIS_USER
+SMILEYAN_BACKEND_REDIS_PASSWORD=$S_REDIS_PASS
+SMILEYAN_BACKEND_EMAIL_PASSWORD=$S_EMAIL_PASS
+SMILEYAN_BACKEND_JWT_SECRET=$S_JWT_SECRET
+EOF
+chmod 600 "$SHARED_ENV_TMP"
+mv -f "$SHARED_ENV_TMP" "$SHARED_ENV"
+echo "Wrote $SHARED_ENV (mode 0600)"
 
 # Stop the currently running instance (if any).
 if [ -x "$CURRENT_LINK/stop.sh" ]; then

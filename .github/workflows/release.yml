@@ -257,6 +257,18 @@ jobs:
           SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
           SERVER_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
           RELEASE_TAG: ${{ github.ref_name }}
+          # Application secrets forwarded to the server's shared/.env.
+          # The server-side script will refuse to run if any of these
+          # are empty (see the `: ${...:?}` guards in deploy-remote.sh).
+          S_DB_HOST: ${{ secrets.SMILEYAN_BACKEND_DB_HOST }}
+          S_DB_USER: ${{ secrets.SMILEYAN_BACKEND_DB_USER }}
+          S_DB_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_DB_PASSWORD }}
+          S_DB_NAME: ${{ secrets.SMILEYAN_BACKEND_DB_NAME }}
+          S_REDIS_HOST: ${{ secrets.SMILEYAN_BACKEND_REDIS_HOST }}
+          S_REDIS_USER: ${{ secrets.SMILEYAN_BACKEND_REDIS_USERNAME }}
+          S_REDIS_PASS: ${{ secrets.SMILEYAN_BACKEND_REDIS_PASSWORD }}
+          S_EMAIL_PASS: ${{ secrets.SMILEYAN_BACKEND_EMAIL_PASSWORD }}
+          S_JWT_SECRET: ${{ secrets.SMILEYAN_BACKEND_JWT_SECRET }}
         run: |
           set -euo pipefail
           echo ">>> Uploading deploy script to /tmp/deploy-remote.sh"
@@ -265,15 +277,24 @@ jobs:
             "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/deploy-remote.sh"
 
           echo ">>> Running deploy-remote.sh on the server (streaming output)"
-          # Use `bash -x` to trace every command, and pipe through `cat` to
-          # flush stdout line-by-line so the Actions log shows progress
-          # even if the script later detaches the daemon.
+          # All ten values are local shell variables and are inlined into
+          # the remote command by the local shell. The single-quoted
+          # command body prevents any further re-expansion on the server.
           ssh -p "$SSH_INSTANCE_PORT" \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
             "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
             "DEPLOY_PATH='$SERVER_DEPLOY_PATH' \
              RELEASE_TAG='$RELEASE_TAG' \
              TARBALL_PATH='/tmp/smileyan-backend-prod.tar.gz' \
+             S_DB_HOST='$S_DB_HOST' \
+             S_DB_USER='$S_DB_USER' \
+             S_DB_PASSWORD='$S_DB_PASSWORD' \
+             S_DB_NAME='$S_DB_NAME' \
+             S_REDIS_HOST='$S_REDIS_HOST' \
+             S_REDIS_USER='$S_REDIS_USER' \
+             S_REDIS_PASS='$S_REDIS_PASS' \
+             S_EMAIL_PASS='$S_EMAIL_PASS' \
+             S_JWT_SECRET='$S_JWT_SECRET' \
              bash -x /tmp/deploy-remote.sh"
 
       - name: Inspect server-side state
