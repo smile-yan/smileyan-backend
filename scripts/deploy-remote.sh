@@ -67,9 +67,11 @@ tar -xzf "$TARBALL_PATH" -C "$RELEASE_PATH"
 cat > "$RELEASE_PATH/start.sh" <<'START'
 #!/bin/bash
 cd "$(dirname "$0")"
-if [ -f ../shared/.env ]; then
+# start.sh lives in releases/<tag>/, so two levels up is $DEPLOY_PATH.
+# We need $DEPLOY_PATH/shared/.env.
+if [ -f ../../shared/.env ]; then
   set -a
-  . ../shared/.env
+  . ../../shared/.env
   set +a
 fi
 # The release ships a prebuilt binary built by the CI runner; the host
