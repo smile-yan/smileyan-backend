@@ -256,20 +256,53 @@ jobs:
           SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
           SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
           SERVER_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          set -e
-          # Pass the three required values into the remote script via env vars.
-          # The heredoc here is a single-line, fully quoted shell command that
-          # the local shell evaluates; the remote script itself is the
-          # well-formed `scripts/deploy-remote.sh` file in the repo.
-          DEPLOY_PATH="$SERVER_DEPLOY_PATH" \
-          RELEASE_TAG="${{ github.ref_name }}" \
-          TARBALL_PATH="/tmp/smileyan-backend-prod.tar.gz" \
+          set -euo pipefail
+          echo ">>> Uploading deploy script to /tmp/deploy-remote.sh"
           scp -P "$SSH_INSTANCE_PORT" \
             scripts/deploy-remote.sh \
             "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/deploy-remote.sh"
-          ssh -p "$SSH_INSTANCE_PORT" "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
-            "DEPLOY_PATH='$SERVER_DEPLOY_PATH' RELEASE_TAG='${{ github.ref_name }}' TARBALL_PATH='/tmp/smileyan-backend-prod.tar.gz' bash /tmp/deploy-remote.sh"
+
+          echo ">>> Running deploy-remote.sh on the server (streaming output)"
+          # Use `bash -x` to trace every command, and pipe through `cat` to
+          # flush stdout line-by-line so the Actions log shows progress
+          # even if the script later detaches the daemon.
+          ssh -p "$SSH_INSTANCE_PORT" \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
+            "DEPLOY_PATH='$SERVER_DEPLOY_PATH' \
+             RELEASE_TAG='$RELEASE_TAG' \
+             TARBALL_PATH='/tmp/smileyan-backend-prod.tar.gz' \
+             bash -x /tmp/deploy-remote.sh"
+
+      - name: Inspect server-side state
+        env:
+          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
+          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
+          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
+          SERVER_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
+        run: |
+          ssh -p "$SSH_INSTANCE_PORT" \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" bash -s <<'REMOTE'
+            set +e
+            DEPLOY_PATH="$SERVER_DEPLOY_PATH"
+            echo "=== current symlink ==="
+            ls -la "$DEPLOY_PATH/current" 2>&1 || true
+            echo
+            echo "=== release directory ==="
+            ls -la "$DEPLOY_PATH/current/" 2>&1 || true
+            echo
+            echo "=== last 30 lines of app.log ==="
+            tail -n 30 "$DEPLOY_PATH/current/logs/app.log" 2>&1 || true
+            echo
+            echo "=== process list (smileyan-backend) ==="
+            ps -ef | grep -E '[s]mileyan-backend' || echo "(no smileyan-backend process)"
+            echo
+            echo "=== listening sockets on 8080 ==="
+            (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep -E ':8080' || echo "(nothing on :8080)"
+          REMOTE
 
       - name: Verify deployment
         env:
@@ -278,6 +311,8 @@ jobs:
           SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
         run: |
           # Give the process a moment to bind the port.
-          sleep 3
-          ssh -p "$SSH_INSTANCE_PORT" "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
+          sleep 5
+          ssh -p "$SSH_INSTANCE_PORT" \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
             "curl -fsS http://127.0.0.1:8080/api/categories >/dev/null && echo 'Health check OK'"
