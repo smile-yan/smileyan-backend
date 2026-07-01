@@ -97,6 +97,65 @@ go run main.go
 
 服务启动后访问 `http://localhost:8080` 查看相关接口。
 
+## 部署
+
+推送 `v*.*.*` 形式的 tag 会自动触发 `.github/workflows/release.yml`：构建 `linux/amd64` 静态二进制、发布到 GitHub Release、并通过 SSH 部署到 `SERVERS_CONFIG` 列出的每一台服务器（并行）。`v*.*.*-rc` / `-alpha` / `-beta` 形式的 tag 只发 release 不部署，并自动标记为 GitHub prerelease。
+
+### 必需的 GitHub Secrets
+
+在仓库 `Settings -> Secrets and variables -> Actions` 中配置：
+
+| Secret | 说明 |
+|--------|------|
+| `SMILEYAN_BACKEND_DB_HOST` / `_USER` / `_PASSWORD` / `_NAME` | MySQL 连接信息（**所有服务器共用**） |
+| `SMILEYAN_BACKEND_REDIS_HOST` / `_USERNAME` / `_PASSWORD` | Redis 连接信息（**所有服务器共用**） |
+| `SMILEYAN_BACKEND_EMAIL_PASSWORD` | SMTP 邮箱密码（**所有服务器共用**） |
+| `SMILEYAN_BACKEND_JWT_SECRET` | JWT 签名密钥（**所有服务器共用**） |
+| `DEPLOY_SSH_KEY` | 部署用 SSH 私钥（**所有服务器共用同一把**，需提前把对应公钥加入每台机器的 `authorized_keys`） |
+| `SERVERS_CONFIG` | 部署目标服务器列表（JSON 数组，见下） |
+
+### `SERVERS_CONFIG`
+
+JSON 数组，每项描述一台目标服务器。`name` 在数组内必须唯一；`port` 接受字符串或整数；其余字段为字符串。
+
+```json
+[
+  {
+    "name": "prod-1",
+    "addr": "1.2.3.4",
+    "port": "22",
+    "user": "deploy",
+    "deploy_path": "/opt/smileyan-backend"
+  },
+  {
+    "name": "prod-2",
+    "addr": "5.6.7.8",
+    "port": "2222",
+    "user": "ubuntu",
+    "deploy_path": "/srv/smileyan-backend"
+  }
+]
+```
+
+| 字段 | 说明 |
+|------|------|
+| `name` | 仅用于日志标识 / Actions UI 区分多机 job，必须在数组内唯一 |
+| `addr` | 主机名或 IP |
+| `port` | SSH 端口 |
+| `user` | SSH 登录用户名（须对 `deploy_path` 有写权限） |
+| `deploy_path` | 服务器上的部署根目录，脚本会创建 `releases/<tag>/` 和 `shared/.env` |
+
+添加 / 删除部署目标**只需编辑这一个 secret**，不需要改 workflow 文件。每次 tag 触发时所有机器**并行部署**（`strategy.fail-fast: false`），单台失败不会取消其他机器 —— 想看完整结果再介入时这个行为很关键。
+
+> 启动 `Diagnose secret availability` 步骤会预先校验 `SERVERS_CONFIG` 的结构（数组非空、每项字段齐全、端口为数字、名字不重复），配置写错会立即以具体错误信息失败，不会让 `fromJSON` 抛一个模糊的报错。
+
+### 已废弃的 secrets
+
+以下旧版 workflow 用过的 secret 不再被读取，可以从仓库设置中删除（保留也完全无害）：
+
+- `SSH_INSTANCE_ADDR`、`SSH_INSTANCE_PORT`、`SSH_INSTANCE_USER`
+- `SERVER_DEPLOY_PATH`
+
 ## 许可证
 
 MIT

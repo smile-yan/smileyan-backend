@@ -6,7 +6,8 @@ name: Release
 #   (no binary, no .env, no secrets).
 # - Auto-generates a changelog from grouped PRs / commits since the previous tag.
 # - For stable (non-prerelease) tags, additionally deploys the new release
-#   to the production CentOS server over SSH.
+#   to one or more production servers over SSH in parallel (one matrix leg
+#   per server, configured via the SERVERS_CONFIG secret — see below).
 
 on:
   push:
@@ -120,7 +121,7 @@ jobs:
           fail_on_unmatched_files: true
 
   deploy:
-    name: Deploy to production server
+    name: Deploy to ${{ matrix.server.name }}
     # Only deploy on real release tags, never on rc/alpha/beta.
     # Mirrors the prerelease check in the release job above.
     needs: release
@@ -128,6 +129,38 @@ jobs:
     runs-on: ubuntu-latest
     # Don't let a failed deploy silently fall through; surface it.
     continue-on-error: false
+    # fail-fast: false so a single failing server doesn't cancel the others
+    # mid-deploy (you usually want to see all results before intervening).
+    strategy:
+      fail-fast: false
+      matrix:
+        # SERVERS_CONFIG is a JSON array of objects, stored as a single
+        # GitHub secret. The shared DEPLOY_SSH_KEY is reused across all
+        # servers. Application-level secrets (DB/Redis/Email/JWT) are also
+        # shared — they are not part of the per-server config.
+        #
+        # Example SERVERS_CONFIG:
+        # [
+        #   {
+        #     "name": "prod-1",
+        #     "addr": "1.2.3.4",
+        #     "port": "22",
+        #     "user": "deploy",
+        #     "deploy_path": "/opt/smileyan-backend"
+        #   },
+        #   {
+        #     "name": "prod-2",
+        #     "addr": "5.6.7.8",
+        #     "port": "2222",
+        #     "user": "ubuntu",
+        #     "deploy_path": "/srv/smileyan-backend"
+        #   }
+        # ]
+        #
+        # `name` is a free-form label used for log identification only.
+        # It must be unique across the array. `port` is a string (per
+        # scp/ssh CLI convention) but must be numeric.
+        server: ${{ fromJSON(secrets.SERVERS_CONFIG) }}
 
     steps:
       - name: Checkout
@@ -141,7 +174,10 @@ jobs:
       - name: Diagnose secret availability
         # Test each secret by reading its value into a bash variable. An
         # unconfigured secret expands to the empty string, so an empty
-        # value is the "missing" signal.
+        # value is the "missing" signal. This step also validates the
+        # shape of SERVERS_CONFIG (must be a non-empty array of objects
+        # with the required fields) so a single bad entry fails fast
+        # with a clear message instead of confusing matrix errors.
         #
         # We previously tried the GitHub Secrets API to list configured
         # names, but the default GITHUB_TOKEN returns 403 on that endpoint
@@ -158,31 +194,10 @@ jobs:
           S_REDIS_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_REDIS_PASSWORD }}
           S_EMAIL_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_EMAIL_PASSWORD }}
           S_JWT_SECRET: ${{ secrets.SMILEYAN_BACKEND_JWT_SECRET }}
-          S_SSH_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
-          S_SSH_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
-          S_SSH_USER: ${{ secrets.SSH_INSTANCE_USER }}
           S_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          S_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
+          S_SERVERS_CONFIG: ${{ secrets.SERVERS_CONFIG }}
         run: |
           set -u
-          # Format: "NAME|VALUE". VALUE is "set" if non-empty, otherwise "empty".
-          PAIRS=(
-            "SMILEYAN_BACKEND_DB_HOST|${S_DB_HOST}"
-            "SMILEYAN_BACKEND_DB_USER|${S_DB_USER}"
-            "SMILEYAN_BACKEND_DB_PASSWORD|${S_DB_PASSWORD}"
-            "SMILEYAN_BACKEND_DB_NAME|${S_DB_NAME}"
-            "SMILEYAN_BACKEND_REDIS_HOST|${S_REDIS_HOST}"
-            "SMILEYAN_BACKEND_REDIS_USERNAME|${S_REDIS_USERNAME}"
-            "SMILEYAN_BACKEND_REDIS_PASSWORD|${S_REDIS_PASSWORD}"
-            "SMILEYAN_BACKEND_EMAIL_PASSWORD|${S_EMAIL_PASSWORD}"
-            "SMILEYAN_BACKEND_JWT_SECRET|${S_JWT_SECRET}"
-            "SSH_INSTANCE_ADDR|${S_SSH_ADDR}"
-            "SSH_INSTANCE_PORT|${S_SSH_PORT}"
-            "SSH_INSTANCE_USER|${S_SSH_USER}"
-            "DEPLOY_SSH_KEY|${S_SSH_KEY}"
-            "SERVER_DEPLOY_PATH|${S_DEPLOY_PATH}"
-          )
-
           echo "=== Secret availability report ==="
           echo "A secret counts as 'OK' if its value is non-empty."
           echo "An empty value means either the secret is not configured, or"
@@ -192,20 +207,80 @@ jobs:
           printf '%-40s %s\n' 'SECRET' 'STATUS'
           printf '%-40s %s\n' '------' '------'
           MISSING=()
-          for pair in "${PAIRS[@]}"; do
-            name="${pair%%|*}"
-            val="${pair#*|}"
+
+          check_one() {
+            local name="$1"
+            local val="$2"
             if [ -n "$val" ]; then
               printf '%-40s %s\n' "$name" 'OK (non-empty)'
             else
               printf '%-40s %s\n' "$name" 'EMPTY (not accessible to this workflow)'
               MISSING+=("$name")
             fi
-          done
+          }
+
+          # Application-level secrets (shared across all servers).
+          check_one SMILEYAN_BACKEND_DB_HOST       "$S_DB_HOST"
+          check_one SMILEYAN_BACKEND_DB_USER       "$S_DB_USER"
+          check_one SMILEYAN_BACKEND_DB_PASSWORD   "$S_DB_PASSWORD"
+          check_one SMILEYAN_BACKEND_DB_NAME       "$S_DB_NAME"
+          check_one SMILEYAN_BACKEND_REDIS_HOST    "$S_REDIS_HOST"
+          check_one SMILEYAN_BACKEND_REDIS_USERNAME "$S_REDIS_USERNAME"
+          check_one SMILEYAN_BACKEND_REDIS_PASSWORD "$S_REDIS_PASSWORD"
+          check_one SMILEYAN_BACKEND_EMAIL_PASSWORD "$S_EMAIL_PASSWORD"
+          check_one SMILEYAN_BACKEND_JWT_SECRET    "$S_JWT_SECRET"
+          check_one DEPLOY_SSH_KEY                 "$S_SSH_KEY"
+
+          # SERVERS_CONFIG: validate structure with python (always present
+          # on ubuntu-latest runners).
+          echo
+          echo "=== SERVERS_CONFIG validation ==="
+          if [ -z "${S_SERVERS_CONFIG:-}" ]; then
+            printf '%-40s %s\n' 'SERVERS_CONFIG' 'EMPTY (not accessible)'
+            MISSING+=("SERVERS_CONFIG")
+          else
+            printf '%-40s %s\n' 'SERVERS_CONFIG' "OK (length: ${#S_SERVERS_CONFIG} bytes)"
+            if ! python3 - "$S_SERVERS_CONFIG" <<'PY'
+          import json, sys
+          raw = sys.argv[1]
+          try:
+              cfg = json.loads(raw)
+          except json.JSONDecodeError as e:
+              print(f"ERROR: SERVERS_CONFIG is not valid JSON: {e}", file=sys.stderr)
+              sys.exit(1)
+          if not isinstance(cfg, list):
+              print("ERROR: SERVERS_CONFIG must be a JSON array, got " + type(cfg).__name__, file=sys.stderr)
+              sys.exit(1)
+          if not cfg:
+              print("ERROR: SERVERS_CONFIG is an empty array; no servers to deploy to", file=sys.stderr)
+              sys.exit(1)
+          required = ("name", "addr", "port", "user", "deploy_path")
+          seen_names = set()
+          for i, s in enumerate(cfg):
+              if not isinstance(s, dict):
+                  print(f"ERROR: SERVERS_CONFIG[{i}] is not an object", file=sys.stderr)
+                  sys.exit(1)
+              missing = [f for f in required if not s.get(f)]
+              if missing:
+                  print(f"ERROR: SERVERS_CONFIG[{i}] missing fields: {missing}", file=sys.stderr)
+                  sys.exit(1)
+              if not isinstance(s["port"], (int, str)) or (isinstance(s["port"], str) and not s["port"].isdigit()):
+                  print(f"ERROR: SERVERS_CONFIG[{i}].port must be numeric, got {s['port']!r}", file=sys.stderr)
+                  sys.exit(1)
+              if s["name"] in seen_names:
+                  print(f"ERROR: SERVERS_CONFIG has duplicate name: {s['name']!r}", file=sys.stderr)
+                  sys.exit(1)
+              seen_names.add(s["name"])
+          print(f"OK: {len(cfg)} server(s) configured: {sorted(seen_names)}")
+          PY
+            then
+              MISSING+=("SERVERS_CONFIG_VALIDATION")
+            fi
+          fi
 
           echo
           if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "FAIL: ${#MISSING[@]} required secret(s) are not accessible:"
+            echo "FAIL: ${#MISSING[@]} required secret(s) are not accessible or invalid:"
             printf '  - %s\n' "${MISSING[@]}"
             echo
             echo "Most likely causes:"
@@ -241,27 +316,26 @@ jobs:
 
       - name: Add server to known_hosts
         # Avoid the "host key verification failed" interactive prompt.
+        # Each matrix leg has its own host:port, so this must be per-leg.
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -p "${{ secrets.SSH_INSTANCE_PORT }}" \
-            -H "${{ secrets.SSH_INSTANCE_ADDR }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -p "${{ matrix.server.port }}" \
+            -H "${{ matrix.server.addr }}" >> ~/.ssh/known_hosts
 
       - name: Upload tarball to server
-        env:
-          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
-          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
-          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
         run: |
           set -e
-          scp -P "$SSH_INSTANCE_PORT" dist/smileyan-backend-prod.tar.gz \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/smileyan-backend-prod.tar.gz"
+          echo ">>> [${{ matrix.server.name }}] Uploading tarball to ${{ matrix.server.user }}@${{ matrix.server.addr }}:${{ matrix.server.port }}"
+          scp -P "${{ matrix.server.port }}" dist/smileyan-backend-prod.tar.gz \
+            "${{ matrix.server.user }}@${{ matrix.server.addr }}:/tmp/smileyan-backend-prod.tar.gz"
 
       - name: Run remote deploy script
         env:
-          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
-          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
-          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
-          SERVER_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
+          # The matrix value is hoisted to a named env var so the bash
+          # single-quoted command body (which prevents remote expansion)
+          # can still reference it.
+          SERVER_NAME: ${{ matrix.server.name }}
+          SERVER_DEPLOY_PATH: ${{ matrix.server.deploy_path }}
           RELEASE_TAG: ${{ github.ref_name }}
           # Application secrets forwarded to the server's shared/.env.
           # The server-side script will refuse to run if any of these
@@ -278,7 +352,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo ">>> Extracting deploy-remote.sh from the release tarball"
+          echo ">>> [$SERVER_NAME] Extracting deploy-remote.sh from the release tarball"
           # The tarball now ships deploy-remote.sh alongside the binary, so
           # we no longer need a separate scp of scripts/deploy-remote.sh.
           # Pull it out locally first, then upload it to /tmp on the server.
@@ -289,18 +363,18 @@ jobs:
           tar -xzf dist/smileyan-backend-prod.tar.gz -C /tmp/deploy-tools ./deploy-remote.sh
           chmod +x /tmp/deploy-tools/deploy-remote.sh
 
-          echo ">>> Uploading deploy script to /tmp/deploy-remote.sh"
-          scp -P "$SSH_INSTANCE_PORT" \
+          echo ">>> [$SERVER_NAME] Uploading deploy script to /tmp/deploy-remote.sh"
+          scp -P "${{ matrix.server.port }}" \
             /tmp/deploy-tools/deploy-remote.sh \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/deploy-remote.sh"
+            "${{ matrix.server.user }}@${{ matrix.server.addr }}:/tmp/deploy-remote.sh"
 
-          echo ">>> Running deploy-remote.sh on the server (streaming output)"
+          echo ">>> [$SERVER_NAME] Running deploy-remote.sh on the server (streaming output)"
           # All ten values are local shell variables and are inlined into
           # the remote command by the local shell. The single-quoted
           # command body prevents any further re-expansion on the server.
-          ssh -p "$SSH_INSTANCE_PORT" \
+          ssh -p "${{ matrix.server.port }}" \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
+            "${{ matrix.server.user }}@${{ matrix.server.addr }}" \
             "DEPLOY_PATH='$SERVER_DEPLOY_PATH' \
              RELEASE_TAG='$RELEASE_TAG' \
              TARBALL_PATH='/tmp/smileyan-backend-prod.tar.gz' \
@@ -317,16 +391,15 @@ jobs:
 
       - name: Inspect server-side state
         env:
-          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
-          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
-          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
-          SERVER_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
+          SERVER_NAME: ${{ matrix.server.name }}
+          SERVER_DEPLOY_PATH: ${{ matrix.server.deploy_path }}
         run: |
+          echo ">>> [$SERVER_NAME] Inspecting post-deploy state"
           # Pass DEPLOY_PATH as an env var to the remote shell so the
           # single-quoted heredoc body (no $ expansion) can still use it.
-          ssh -p "$SSH_INSTANCE_PORT" \
+          ssh -p "${{ matrix.server.port }}" \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
+            "${{ matrix.server.user }}@${{ matrix.server.addr }}" \
             env DEPLOY_PATH="$SERVER_DEPLOY_PATH" bash -s <<'REMOTE'
             set +e
             echo "=== DEPLOY_PATH is: [$DEPLOY_PATH] ==="
@@ -349,13 +422,12 @@ jobs:
 
       - name: Verify deployment
         env:
-          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
-          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
-          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
+          SERVER_NAME: ${{ matrix.server.name }}
         run: |
           # Give the process a moment to bind the port.
           sleep 5
-          ssh -p "$SSH_INSTANCE_PORT" \
+          echo ">>> [$SERVER_NAME] Running health check"
+          ssh -p "${{ matrix.server.port }}" \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
-            "curl -fsS http://127.0.0.1:8080/api/categories >/dev/null && echo 'Health check OK'"
+            "${{ matrix.server.user }}@${{ matrix.server.addr }}" \
+            "curl -fsS http://127.0.0.1:8080/api/categories >/dev/null && echo '[$SERVER_NAME] Health check OK'"
