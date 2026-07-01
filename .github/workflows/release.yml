@@ -37,12 +37,12 @@ jobs:
 
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0   # full history needed for changelog generation
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25'
           cache: true
@@ -96,7 +96,7 @@ jobs:
           tar --no-xattr -czf smileyan-backend-prod.tar.gz -C release .
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
@@ -128,7 +128,7 @@ jobs:
         # Required so `gh release download` can locate the repo via .git
         # (it reads `git config --get remote.origin.url` to know which
         # release to fetch). No source code from this checkout is used.
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
@@ -229,7 +229,7 @@ jobs:
       - name: Set up SSH key
         # Writes the private key to a file with 0600 perms and registers it
         # with ssh-agent so subsequent steps can use it transparently.
-        uses: webfactory/ssh-agent@v0.9.0
+        uses: webfactory/ssh-agent@v0.10.0
         with:
           ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
 
