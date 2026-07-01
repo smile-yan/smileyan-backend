@@ -13,6 +13,9 @@ func SetupRoutes(r *gin.Engine) {
 	// 公共路由
 	public := r.Group("/api")
 	{
+		// 测试接口
+		public.GET("/hello", controllers.Hello)
+
 		// 用户相关
 		public.POST("/send-code", controllers.SendVerificationCode)
 		public.POST("/login", controllers.Login)
