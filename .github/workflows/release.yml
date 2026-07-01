@@ -42,6 +42,25 @@ jobs:
         with:
           fetch-depth: 0   # full history needed for changelog generation
 
+      - name: Print SERVERS_CONFIG (debug)
+        # Surface the raw value of the SERVERS_CONFIG variable as the
+        # runner sees it. This is a diagnostic step that always runs
+        # (even when the variable is unset), so a misconfigured variable
+        # is obvious in the log instead of failing the deploy job with
+        # an opaque "fromJSON: empty input" error.
+        env:
+          RAW: ${{ vars.SERVERS_CONFIG }}
+        run: |
+          echo "=== vars.SERVERS_CONFIG (raw, repr) ==="
+          printf '%s\n' "${RAW:-<unset>}" | python3 -c "import sys; data=sys.stdin.read(); print(repr(data))"
+          echo
+          echo "=== length / line count ==="
+          if [ -z "${RAW:-}" ]; then
+            echo "<empty / unset>"
+          else
+            printf 'bytes=%d  lines=%d\n' "${#RAW}" "$(printf '%s' "$RAW" | wc -l | tr -d ' ')"
+          fi
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -166,7 +185,13 @@ jobs:
         # `name` is a free-form label used for log identification only.
         # It must be unique across the array. `port` is a string (per
         # scp/ssh CLI convention) but must be numeric.
-        server: ${{ fromJSON(vars.SERVERS_CONFIG) }}
+        #
+        # The `|| '[]'` fallback means an unset / empty SERVERS_CONFIG
+        # is treated as "no servers to deploy to" and silently skips the
+        # deploy job, instead of failing strategy evaluation with an
+        # opaque "empty input" error. The "Print SERVERS_CONFIG" step in
+        # the release job still surfaces the raw value for debugging.
+        server: ${{ fromJSON(vars.SERVERS_CONFIG || '[]') }}
 
     steps:
       - name: Checkout
