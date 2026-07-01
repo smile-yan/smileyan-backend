@@ -6,7 +6,8 @@ name: Release
 #   (no binary, no .env, no secrets).
 # - Auto-generates a changelog from grouped PRs / commits since the previous tag.
 # - For stable (non-prerelease) tags, additionally deploys the new release
-#   to the production CentOS server over SSH.
+#   to one or more production servers over SSH in parallel (one matrix leg
+#   per server, configured via the SERVERS_CONFIG variable — see below).
 
 on:
   push:
@@ -40,6 +41,25 @@ jobs:
         uses: actions/checkout@v5
         with:
           fetch-depth: 0   # full history needed for changelog generation
+
+      - name: Print SERVERS_CONFIG (debug)
+        # Surface the raw value of the SERVERS_CONFIG variable as the
+        # runner sees it. Always runs (even when the variable is unset),
+        # so a misconfigured variable is obvious in the log instead of
+        # failing the deploy job with an opaque "fromJSON: empty input"
+        # error during strategy evaluation.
+        env:
+          RAW: ${{ vars.SERVERS_CONFIG }}
+        run: |
+          echo "=== vars.SERVERS_CONFIG (raw, repr) ==="
+          printf '%s\n' "${RAW:-<unset>}" | python3 -c "import sys; data=sys.stdin.read(); print(repr(data))"
+          echo
+          echo "=== length / line count ==="
+          if [ -z "${RAW:-}" ]; then
+            echo "<empty / unset>"
+          else
+            printf 'bytes=%d  lines=%d\n' "${#RAW}" "$(printf '%s' "$RAW" | wc -l | tr -d ' ')"
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -120,7 +140,7 @@ jobs:
           fail_on_unmatched_files: true
 
   deploy:
-    name: Deploy to production server
+    name: Deploy to ${{ matrix.server.name }}
     # Only deploy on real release tags, never on rc/alpha/beta.
     # Mirrors the prerelease check in the release job above.
     needs: release
@@ -128,26 +148,76 @@ jobs:
     runs-on: ubuntu-latest
     # Don't let a failed deploy silently fall through; surface it.
     continue-on-error: false
+    # fail-fast: false so a single failing server doesn't cancel the others
+    # mid-deploy (you usually want to see all results before intervening).
+    strategy:
+      fail-fast: false
+      matrix:
+        # SERVERS_CONFIG is a JSON array of objects, stored as a
+        # **Repository Variable** (Settings -> Secrets and variables ->
+        # Actions -> Variables tab), NOT as a secret. GitHub Actions
+        # rejects `secrets.*` inside `strategy.matrix` because matrix
+        # values are written to the workflow run log. Variables are
+        # encrypted at rest but allowed in matrix expressions.
+        #
+        # The shared DEPLOY_SSH_KEY is reused across all servers.
+        # Application-level secrets (DB/Redis/Email/JWT) are also shared
+        # — they are not part of the per-server config.
+        #
+        # Example SERVERS_CONFIG:
+        # [
+        #   {
+        #     "name": "prod-1",
+        #     "addr": "1.2.3.4",
+        #     "port": "22",
+        #     "user": "deploy",
+        #     "deploy_path": "/opt/smileyan-backend"
+        #   },
+        #   {
+        #     "name": "prod-2",
+        #     "addr": "5.6.7.8",
+        #     "port": "2222",
+        #     "user": "ubuntu",
+        #     "deploy_path": "/srv/smileyan-backend"
+        #   }
+        # ]
+        #
+        # `name` is a free-form label used for log identification only.
+        # It must be unique across the array. `port` is a string (per
+        # scp/ssh CLI convention) but must be numeric.
+        #
+        # The `|| '[]'` fallback means an unset / empty SERVERS_CONFIG
+        # is treated as "no servers to deploy to" and silently skips the
+        # deploy job, instead of failing strategy evaluation with an
+        # opaque "empty input" error. The "Print SERVERS_CONFIG (debug)"
+        # step in the release job still surfaces the raw value.
+        server: ${{ fromJSON(vars.SERVERS_CONFIG || '[]') }}
 
     steps:
-      - name: Checkout
-        # Required so `gh release download` can locate the repo via .git
-        # (it reads `git config --get remote.origin.url` to know which
-        # release to fetch). No source code from this checkout is used.
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
-
-      - name: Diagnose secret availability
-        # Test each secret by reading its value into a bash variable. An
-        # unconfigured secret expands to the empty string, so an empty
-        # value is the "missing" signal.
+      - name: Check required env vars
+        # First step of the deploy job on purpose: this is a hard
+        # precondition gate. We fail fast with a clear list of which
+        # secrets are missing BEFORE doing any other work (checkout,
+        # tarball download, ssh setup), so a misconfigured repo
+        # surfaces in seconds rather than after a checkout + 5+ minutes
+        # of unrelated setup. The step also does not require the repo
+        # to be checked out, so it can run as the absolute first step.
         #
-        # We previously tried the GitHub Secrets API to list configured
-        # names, but the default GITHUB_TOKEN returns 403 on that endpoint
-        # (it requires a PAT or a token with `secrets: read` scope). The
-        # value-test approach below is more reliable and doesn't need any
-        # extra scopes.
+        # Each secret is read into a bash variable via `env:`. An
+        # unconfigured secret expands to the empty string, so an empty
+        # value is the "missing" signal. We previously tried the GitHub
+        # Secrets API to list configured names, but the default
+        # GITHUB_TOKEN returns 403 on that endpoint (it requires a PAT
+        # or a token with `secrets: read` scope). The value-test
+        # approach below is more reliable and doesn't need any extra
+        # scopes.
+        #
+        # Note: SERVERS_CONFIG (the per-server deploy target list) is
+        # NOT checked here. It's a Repository Variable, not a secret,
+        # and the `|| '[]'` matrix fallback already handles the empty
+        # case by silently skipping the deploy job. See the "Print
+        # SERVERS_CONFIG (debug)" step in the release job for raw-value
+        # diagnostics.
         env:
           S_DB_HOST: ${{ secrets.SMILEYAN_BACKEND_DB_HOST }}
           S_DB_USER: ${{ secrets.SMILEYAN_BACKEND_DB_USER }}
@@ -158,14 +228,9 @@ jobs:
           S_REDIS_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_REDIS_PASSWORD }}
           S_EMAIL_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_EMAIL_PASSWORD }}
           S_JWT_SECRET: ${{ secrets.SMILEYAN_BACKEND_JWT_SECRET }}
-          S_SSH_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
-          S_SSH_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
-          S_SSH_USER: ${{ secrets.SSH_INSTANCE_USER }}
           S_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          S_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
         run: |
           set -u
-          # Format: "NAME|VALUE". VALUE is "set" if non-empty, otherwise "empty".
           PAIRS=(
             "SMILEYAN_BACKEND_DB_HOST|${S_DB_HOST}"
             "SMILEYAN_BACKEND_DB_USER|${S_DB_USER}"
@@ -176,21 +241,17 @@ jobs:
             "SMILEYAN_BACKEND_REDIS_PASSWORD|${S_REDIS_PASSWORD}"
             "SMILEYAN_BACKEND_EMAIL_PASSWORD|${S_EMAIL_PASSWORD}"
             "SMILEYAN_BACKEND_JWT_SECRET|${S_JWT_SECRET}"
-            "SSH_INSTANCE_ADDR|${S_SSH_ADDR}"
-            "SSH_INSTANCE_PORT|${S_SSH_PORT}"
-            "SSH_INSTANCE_USER|${S_SSH_USER}"
             "DEPLOY_SSH_KEY|${S_SSH_KEY}"
-            "SERVER_DEPLOY_PATH|${S_DEPLOY_PATH}"
           )
 
-          echo "=== Secret availability report ==="
-          echo "A secret counts as 'OK' if its value is non-empty."
+          echo "=== Required env-var report ==="
+          echo "An env var counts as 'OK' if its value is non-empty."
           echo "An empty value means either the secret is not configured, or"
           echo "it is configured as a Deploy Key (Settings/Keys) instead of"
           echo "an Actions secret (Settings -> Secrets and variables -> Actions)."
           echo
-          printf '%-40s %s\n' 'SECRET' 'STATUS'
-          printf '%-40s %s\n' '------' '------'
+          printf '%-40s %s\n' 'NAME' 'STATUS'
+          printf '%-40s %s\n' '----' '------'
           MISSING=()
           for pair in "${PAIRS[@]}"; do
             name="${pair%%|*}"
@@ -205,7 +266,7 @@ jobs:
 
           echo
           if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "FAIL: ${#MISSING[@]} required secret(s) are not accessible:"
+            echo "FAIL: ${#MISSING[@]} required env var(s) are not accessible:"
             printf '  - %s\n' "${MISSING[@]}"
             echo
             echo "Most likely causes:"
@@ -216,7 +277,15 @@ jobs:
             echo "     repository secret with the exact name shown above."
             exit 1
           fi
-          echo "All required secrets are present."
+          echo "All required env vars are present."
+
+      - name: Checkout
+        # Required so `gh release download` can locate the repo via .git
+        # (it reads `git config --get remote.origin.url` to know which
+        # release to fetch). No source code from this checkout is used.
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
 
       - name: Download release tarball
         # Pull the tarball that the release job just published. Using
@@ -241,27 +310,26 @@ jobs:
 
       - name: Add server to known_hosts
         # Avoid the "host key verification failed" interactive prompt.
+        # Each matrix leg has its own host:port, so this must be per-leg.
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -p "${{ secrets.SSH_INSTANCE_PORT }}" \
-            -H "${{ secrets.SSH_INSTANCE_ADDR }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -p "${{ matrix.server.port }}" \
+            -H "${{ matrix.server.addr }}" >> ~/.ssh/known_hosts
 
       - name: Upload tarball to server
-        env:
-          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
-          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
-          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
         run: |
           set -e
-          scp -P "$SSH_INSTANCE_PORT" dist/smileyan-backend-prod.tar.gz \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/smileyan-backend-prod.tar.gz"
+          echo ">>> [${{ matrix.server.name }}] Uploading tarball to ${{ matrix.server.user }}@${{ matrix.server.addr }}:${{ matrix.server.port }}"
+          scp -P "${{ matrix.server.port }}" dist/smileyan-backend-prod.tar.gz \
+            "${{ matrix.server.user }}@${{ matrix.server.addr }}:/tmp/smileyan-backend-prod.tar.gz"
 
       - name: Run remote deploy script
         env:
-          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
-          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
-          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
-          SERVER_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
+          # The matrix value is hoisted to a named env var so the bash
+          # single-quoted command body (which prevents remote expansion)
+          # can still reference it.
+          SERVER_NAME: ${{ matrix.server.name }}
+          SERVER_DEPLOY_PATH: ${{ matrix.server.deploy_path }}
           RELEASE_TAG: ${{ github.ref_name }}
           # Application secrets forwarded to the server's shared/.env.
           # The server-side script will refuse to run if any of these
@@ -278,7 +346,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo ">>> Extracting deploy-remote.sh from the release tarball"
+          echo ">>> [$SERVER_NAME] Extracting deploy-remote.sh from the release tarball"
           # The tarball now ships deploy-remote.sh alongside the binary, so
           # we no longer need a separate scp of scripts/deploy-remote.sh.
           # Pull it out locally first, then upload it to /tmp on the server.
@@ -289,18 +357,18 @@ jobs:
           tar -xzf dist/smileyan-backend-prod.tar.gz -C /tmp/deploy-tools ./deploy-remote.sh
           chmod +x /tmp/deploy-tools/deploy-remote.sh
 
-          echo ">>> Uploading deploy script to /tmp/deploy-remote.sh"
-          scp -P "$SSH_INSTANCE_PORT" \
+          echo ">>> [$SERVER_NAME] Uploading deploy script to /tmp/deploy-remote.sh"
+          scp -P "${{ matrix.server.port }}" \
             /tmp/deploy-tools/deploy-remote.sh \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/deploy-remote.sh"
+            "${{ matrix.server.user }}@${{ matrix.server.addr }}:/tmp/deploy-remote.sh"
 
-          echo ">>> Running deploy-remote.sh on the server (streaming output)"
+          echo ">>> [$SERVER_NAME] Running deploy-remote.sh on the server (streaming output)"
           # All ten values are local shell variables and are inlined into
           # the remote command by the local shell. The single-quoted
           # command body prevents any further re-expansion on the server.
-          ssh -p "$SSH_INSTANCE_PORT" \
+          ssh -p "${{ matrix.server.port }}" \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
+            "${{ matrix.server.user }}@${{ matrix.server.addr }}" \
             "DEPLOY_PATH='$SERVER_DEPLOY_PATH' \
              RELEASE_TAG='$RELEASE_TAG' \
              TARBALL_PATH='/tmp/smileyan-backend-prod.tar.gz' \
@@ -317,16 +385,15 @@ jobs:
 
       - name: Inspect server-side state
         env:
-          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
-          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
-          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
-          SERVER_DEPLOY_PATH: ${{ secrets.SERVER_DEPLOY_PATH }}
+          SERVER_NAME: ${{ matrix.server.name }}
+          SERVER_DEPLOY_PATH: ${{ matrix.server.deploy_path }}
         run: |
+          echo ">>> [$SERVER_NAME] Inspecting post-deploy state"
           # Pass DEPLOY_PATH as an env var to the remote shell so the
           # single-quoted heredoc body (no $ expansion) can still use it.
-          ssh -p "$SSH_INSTANCE_PORT" \
+          ssh -p "${{ matrix.server.port }}" \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
+            "${{ matrix.server.user }}@${{ matrix.server.addr }}" \
             env DEPLOY_PATH="$SERVER_DEPLOY_PATH" bash -s <<'REMOTE'
             set +e
             echo "=== DEPLOY_PATH is: [$DEPLOY_PATH] ==="
@@ -349,13 +416,12 @@ jobs:
 
       - name: Verify deployment
         env:
-          SSH_INSTANCE_ADDR: ${{ secrets.SSH_INSTANCE_ADDR }}
-          SSH_INSTANCE_PORT: ${{ secrets.SSH_INSTANCE_PORT }}
-          SSH_INSTANCE_USER: ${{ secrets.SSH_INSTANCE_USER }}
+          SERVER_NAME: ${{ matrix.server.name }}
         run: |
           # Give the process a moment to bind the port.
           sleep 5
-          ssh -p "$SSH_INSTANCE_PORT" \
+          echo ">>> [$SERVER_NAME] Running health check"
+          ssh -p "${{ matrix.server.port }}" \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
-            "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR" \
-            "curl -fsS http://127.0.0.1:8080/api/categories >/dev/null && echo 'Health check OK'"
+            "${{ matrix.server.user }}@${{ matrix.server.addr }}" \
+            "curl -fsS http://127.0.0.1:8080/api/categories >/dev/null && echo '[$SERVER_NAME] Health check OK'"
