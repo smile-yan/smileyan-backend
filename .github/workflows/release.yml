@@ -134,10 +134,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # SERVERS_CONFIG is a JSON array of objects, stored as a single
-        # GitHub secret. The shared DEPLOY_SSH_KEY is reused across all
-        # servers. Application-level secrets (DB/Redis/Email/JWT) are also
-        # shared — they are not part of the per-server config.
+        # SERVERS_CONFIG is a JSON array of objects, stored as a
+        # **repository variable** (Settings -> Secrets and variables ->
+        # Actions -> Variables tab), NOT as a secret. GitHub Actions
+        # rejects `secrets.*` inside `strategy.matrix` because matrix
+        # values are written to the workflow run log. Variables are
+        # encrypted at rest but allowed in matrix expressions.
+        #
+        # The shared DEPLOY_SSH_KEY is reused across all servers.
+        # Application-level secrets (DB/Redis/Email/JWT) are also shared
+        # — they are not part of the per-server config.
         #
         # Example SERVERS_CONFIG:
         # [
@@ -160,7 +166,7 @@ jobs:
         # `name` is a free-form label used for log identification only.
         # It must be unique across the array. `port` is a string (per
         # scp/ssh CLI convention) but must be numeric.
-        server: ${{ fromJSON(secrets.SERVERS_CONFIG) }}
+        server: ${{ fromJSON(vars.SERVERS_CONFIG) }}
 
     steps:
       - name: Checkout
@@ -195,17 +201,19 @@ jobs:
           S_EMAIL_PASSWORD: ${{ secrets.SMILEYAN_BACKEND_EMAIL_PASSWORD }}
           S_JWT_SECRET: ${{ secrets.SMILEYAN_BACKEND_JWT_SECRET }}
           S_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-          S_SERVERS_CONFIG: ${{ secrets.SERVERS_CONFIG }}
+          S_SERVERS_CONFIG: ${{ vars.SERVERS_CONFIG }}
         run: |
           set -u
-          echo "=== Secret availability report ==="
-          echo "A secret counts as 'OK' if its value is non-empty."
-          echo "An empty value means either the secret is not configured, or"
-          echo "it is configured as a Deploy Key (Settings/Keys) instead of"
-          echo "an Actions secret (Settings -> Secrets and variables -> Actions)."
+          echo "=== Secret / variable availability report ==="
+          echo "A secret or variable counts as 'OK' if its value is non-empty."
+          echo "An empty value means either it is not configured, or (for"
+          echo "secrets only) it is configured as a Deploy Key (Settings/Keys)"
+          echo "instead of an Actions secret (Settings -> Secrets and variables"
+          echo "-> Actions). Variables are configured under the Variables tab"
+          echo "of the same page."
           echo
-          printf '%-40s %s\n' 'SECRET' 'STATUS'
-          printf '%-40s %s\n' '------' '------'
+          printf '%-40s %s\n' 'NAME' 'STATUS'
+          printf '%-40s %s\n' '----' '------'
           MISSING=()
 
           check_one() {
@@ -280,18 +288,19 @@ jobs:
 
           echo
           if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "FAIL: ${#MISSING[@]} required secret(s) are not accessible or invalid:"
+            echo "FAIL: ${#MISSING[@]} required secret(s) / variable(s) are not accessible or invalid:"
             printf '  - %s\n' "${MISSING[@]}"
             echo
             echo "Most likely causes:"
-            echo "  1. The secret is not configured in"
-            echo "     Settings -> Secrets and variables -> Actions."
+            echo "  1. The entry is not configured in"
+            echo "     Settings -> Secrets and variables -> Actions"
+            echo "     (Secrets tab for secrets, Variables tab for SERVERS_CONFIG)."
             echo "  2. The secret is configured under Settings/Keys (Deploy keys)"
             echo "     which workflows cannot read. Copy the same value into a"
             echo "     repository secret with the exact name shown above."
             exit 1
           fi
-          echo "All required secrets are present."
+          echo "All required secrets and variables are present."
 
       - name: Download release tarball
         # Pull the tarball that the release job just published. Using

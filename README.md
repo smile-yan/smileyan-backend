@@ -101,9 +101,9 @@ go run main.go
 
 推送 `v*.*.*` 形式的 tag 会自动触发 `.github/workflows/release.yml`：构建 `linux/amd64` 静态二进制、发布到 GitHub Release、并通过 SSH 部署到 `SERVERS_CONFIG` 列出的每一台服务器（并行）。`v*.*.*-rc` / `-alpha` / `-beta` 形式的 tag 只发 release 不部署，并自动标记为 GitHub prerelease。
 
-### 必需的 GitHub Secrets
+### 必需的 GitHub 配置
 
-在仓库 `Settings -> Secrets and variables -> Actions` 中配置：
+**Secrets**（`Settings -> Secrets and variables -> Actions -> Secrets`）：
 
 | Secret | 说明 |
 |--------|------|
@@ -112,7 +112,14 @@ go run main.go
 | `SMILEYAN_BACKEND_EMAIL_PASSWORD` | SMTP 邮箱密码（**所有服务器共用**） |
 | `SMILEYAN_BACKEND_JWT_SECRET` | JWT 签名密钥（**所有服务器共用**） |
 | `DEPLOY_SSH_KEY` | 部署用 SSH 私钥（**所有服务器共用同一把**，需提前把对应公钥加入每台机器的 `authorized_keys`） |
+
+**Repository Variable**（`Settings -> Secrets and variables -> Actions -> Variables`）：
+
+| Variable | 说明 |
+|----------|------|
 | `SERVERS_CONFIG` | 部署目标服务器列表（JSON 数组，见下） |
+
+> **为什么不是 Secret**：GitHub Actions 拒绝在 `strategy.matrix` 表达式里使用 `secrets.*`（matrix 值会写入 workflow run 日志，泄露 secret 风险）。Repository Variable 加密存储但允许出现在 matrix 中，地址/端口/用户/部署路径也不属于真正的敏感信息（真正的私钥仍在 `DEPLOY_SSH_KEY` 中）。
 
 ### `SERVERS_CONFIG`
 
