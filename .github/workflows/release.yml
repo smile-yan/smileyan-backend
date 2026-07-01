@@ -59,32 +59,40 @@ jobs:
           ls -la /tmp/smileyan-backend
 
       - name: Prepare release assets
-        # Build a clean prod/ folder with the source tree + a prod config.yaml
-        # + the prebuilt linux/amd64 binary. Secrets are intentionally NOT
-        # included.
+        # Build a minimal release/ folder containing EXACTLY three files:
+        #   - smileyan-backend   the prebuilt linux/amd64 binary
+        #   - deploy-remote.sh   the server-side deploy script
+        #   - config.yaml        the prod config (mode: prod)
+        # No source code, no dev scripts, no .env, no secrets.
         run: |
           set -e
           rm -rf release
           mkdir -p release
 
-          # 1. Copy the full source tree (excluding build output / .git).
-          tar --exclude='./release' --exclude='./output' \
-              --exclude='./.git' --exclude='./logs' \
-              --exclude='./uploads' \
-              -czf /tmp/source.tar.gz .
-          tar -xzf /tmp/source.tar.gz -C release
+          # 1. Place the prebuilt binary at the root of the release dir so
+          #    deploy-remote.sh can find it as ./smileyan-backend.
+          mv /tmp/smileyan-backend release/smileyan-backend
+          chmod +x release/smileyan-backend
 
-          # 2. Drop the dev-only packaging script from the release.
-          rm -f release/bin/build-and-package.sh
+          # 2. Bundle the server-side deploy script alongside the binary.
+          cp scripts/deploy-remote.sh release/deploy-remote.sh
+          chmod +x release/deploy-remote.sh
 
           # 3. Generate a prod config.yaml from the committed template.
           #    The `mode: debug` line in config.yaml is replaced with `mode: prod`.
           sed 's/mode: debug/mode: prod/' config.yaml > release/config.yaml
 
-          # 4. Place the prebuilt binary at the root of the release dir so
-          #    deploy-remote.sh can find it as ./smileyan-backend.
-          mv /tmp/smileyan-backend release/smileyan-backend
-          chmod +x release/smileyan-backend
+          # 4. Sanity check: release/ must contain exactly the 3 expected files,
+          #    nothing more. Catches regressions that re-add source code.
+          actual=$(ls -A1 release | sort)
+          expected=$(printf '%s\n' deploy-remote.sh config.yaml smileyan-backend | sort)
+          echo "release/ contents:"
+          echo "$actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "ERROR: release/ contents mismatch." >&2
+            diff <(echo "$expected") <(echo "$actual") >&2
+            exit 1
+          fi
 
           # 5. Sanity check: make sure no .env is in the bundle.
           if find release -name '.env' -print -quit | grep -q .; then
@@ -103,11 +111,9 @@ jobs:
           # Auto-generate the release notes (grouped by PR label / commit type)
           # from the commits and PRs since the previous tag.
           generate_release_notes: true
-          # Upload only the source+prod tarball and the rendered config.yaml.
-          # No binary, no .env, no secrets.
-          files: |
-            smileyan-backend-prod.tar.gz
-            config.yaml
+          # Upload only the minimal prod tarball (binary + deploy script + config).
+          # No source, no .env, no secrets.
+          files: smileyan-backend-prod.tar.gz
           draft: false
           # Tags like v1.2.0-rc1 or v1.2.0-beta3 are flagged as pre-releases.
           prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
@@ -271,9 +277,18 @@ jobs:
           S_JWT_SECRET: ${{ secrets.SMILEYAN_BACKEND_JWT_SECRET }}
         run: |
           set -euo pipefail
+
+          echo ">>> Extracting deploy-remote.sh from the release tarball"
+          # The tarball now ships deploy-remote.sh alongside the binary, so
+          # we no longer need a separate scp of scripts/deploy-remote.sh.
+          # Pull it out locally first, then upload it to /tmp on the server.
+          mkdir -p /tmp/deploy-tools
+          tar -xzf dist/smileyan-backend-prod.tar.gz -C /tmp/deploy-tools deploy-remote.sh
+          chmod +x /tmp/deploy-tools/deploy-remote.sh
+
           echo ">>> Uploading deploy script to /tmp/deploy-remote.sh"
           scp -P "$SSH_INSTANCE_PORT" \
-            scripts/deploy-remote.sh \
+            /tmp/deploy-tools/deploy-remote.sh \
             "$SSH_INSTANCE_USER@$SSH_INSTANCE_ADDR:/tmp/deploy-remote.sh"
 
           echo ">>> Running deploy-remote.sh on the server (streaming output)"
