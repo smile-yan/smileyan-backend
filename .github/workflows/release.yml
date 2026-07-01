@@ -282,8 +282,11 @@ jobs:
           # The tarball now ships deploy-remote.sh alongside the binary, so
           # we no longer need a separate scp of scripts/deploy-remote.sh.
           # Pull it out locally first, then upload it to /tmp on the server.
+          # NOTE: the file is stored with a `./` prefix inside the tarball,
+          # so the extract path must include it (otherwise tar reports
+          # "Not found in archive").
           mkdir -p /tmp/deploy-tools
-          tar -xzf dist/smileyan-backend-prod.tar.gz -C /tmp/deploy-tools deploy-remote.sh
+          tar -xzf dist/smileyan-backend-prod.tar.gz -C /tmp/deploy-tools ./deploy-remote.sh
           chmod +x /tmp/deploy-tools/deploy-remote.sh
 
           echo ">>> Uploading deploy script to /tmp/deploy-remote.sh"
